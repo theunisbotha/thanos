@@ -1167,7 +1167,7 @@ func (s *bucketBlockSet) labelMatchers(matchers ...*labels.Matcher) ([]*labels.M
 // state for the block on local disk.
 type bucketBlock struct {
 	logger     log.Logger
-	bucket     objstore.BucketReader
+	bkt        objstore.BucketReader
 	meta       *metadata.Meta
 	dir        string
 	indexCache storecache.IndexCache
@@ -1198,7 +1198,7 @@ func newBucketBlock(
 ) (b *bucketBlock, err error) {
 	b = &bucketBlock{
 		logger:            logger,
-		bucket:            bkt,
+		bkt:               bkt,
 		indexCache:        indexCache,
 		chunkPool:         chunkPool,
 		dir:               dir,
@@ -1224,7 +1224,7 @@ func (b *bucketBlock) indexFilename() string {
 }
 
 func (b *bucketBlock) readIndexRange(ctx context.Context, off, length int64) ([]byte, error) {
-	r, err := b.bucket.GetRange(ctx, b.indexFilename(), off, length)
+	r, err := b.bkt.GetRange(ctx, b.indexFilename(), off, length)
 	if err != nil {
 		return nil, errors.Wrap(err, "get range reader")
 	}
@@ -1244,7 +1244,7 @@ func (b *bucketBlock) readChunkRange(ctx context.Context, seq int, off, length i
 	}
 	buf := bytes.NewBuffer(*c)
 
-	r, err := b.bucket.GetRange(ctx, b.chunkObjs[seq], off, length)
+	r, err := b.bkt.GetRange(ctx, b.chunkObjs[seq], off, length)
 	if err != nil {
 		b.chunkPool.Put(c)
 		return nil, errors.Wrap(err, "get range reader")
@@ -1261,7 +1261,7 @@ func (b *bucketBlock) readChunkRange(ctx context.Context, seq int, off, length i
 
 func (b *bucketBlock) indexReader(ctx context.Context) *bucketIndexReader {
 	b.pendingReaders.Add(1)
-	return newBucketIndexReader(ctx, b.logger, b, b.indexCache)
+	return newBucketIndexReader(ctx, b)
 }
 
 func (b *bucketBlock) chunkReader(ctx context.Context) *bucketChunkReader {
@@ -1278,27 +1278,23 @@ func (b *bucketBlock) Close() error {
 // bucketIndexReader is a custom index reader (not conforming index.Reader interface) that reads index that is stored in
 // object storage without having to fully download it.
 type bucketIndexReader struct {
-	logger log.Logger
-	ctx    context.Context
-	block  *bucketBlock
-	dec    *index.Decoder
-	stats  *queryStats
-	cache  storecache.IndexCache
+	ctx   context.Context
+	block *bucketBlock
+	dec   *index.Decoder
+	stats *queryStats
 
 	mtx          sync.Mutex
 	loadedSeries map[uint64][]byte
 }
 
-func newBucketIndexReader(ctx context.Context, logger log.Logger, block *bucketBlock, cache storecache.IndexCache) *bucketIndexReader {
+func newBucketIndexReader(ctx context.Context, block *bucketBlock) *bucketIndexReader {
 	r := &bucketIndexReader{
-		logger: logger,
-		ctx:    ctx,
-		block:  block,
+		ctx:   ctx,
+		block: block,
 		dec: &index.Decoder{
 			LookupSymbol: block.indexHeaderReader.LookupSymbol,
 		},
 		stats:        &queryStats{},
-		cache:        cache,
 		loadedSeries: map[uint64][]byte{},
 	}
 	return r
@@ -1464,7 +1460,7 @@ func (r *bucketIndexReader) fetchPostings(groups []*postingGroup) error {
 		keys = append(keys, g.keys...)
 	}
 
-	fromCache, _ := r.cache.FetchMultiPostings(r.ctx, r.block.meta.ULID, keys)
+	fromCache, _ := r.block.indexCache.FetchMultiPostings(r.ctx, r.block.meta.ULID, keys)
 
 	// Iterate over all groups and fetch posting from cache.
 	// If we have a miss, mark key to be fetched in `ptrs` slice.
@@ -1548,7 +1544,7 @@ func (r *bucketIndexReader) fetchPostings(groups []*postingGroup) error {
 				// Return postings and fill LRU cache.
 				// Truncate first 4 bytes which are length of posting.
 				groups[p.groupID].Fill(p.keyID, newBigEndianPostings(pBytes[4:]))
-				r.cache.StorePostings(r.ctx, r.block.meta.ULID, groups[p.groupID].keys[p.keyID], pBytes)
+				r.block.indexCache.StorePostings(r.ctx, r.block.meta.ULID, groups[p.groupID].keys[p.keyID], pBytes)
 
 				// If we just fetched it we still have to update the stats for touched postings.
 				r.stats.postingsTouched++
@@ -1629,7 +1625,7 @@ func (it *bigEndianPostings) Err() error {
 func (r *bucketIndexReader) PreloadSeries(ids []uint64) error {
 	// Load series from cache, overwriting the list of ids to preload
 	// with the missing ones.
-	fromCache, ids := r.cache.FetchMultiSeries(r.ctx, r.block.meta.ULID, ids)
+	fromCache, ids := r.block.indexCache.FetchMultiSeries(r.ctx, r.block.meta.ULID, ids)
 	for id, b := range fromCache {
 		r.loadedSeries[id] = b
 	}
@@ -1678,7 +1674,7 @@ func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []uint64, refetc
 
 			// Inefficient, but should be rare.
 			r.block.seriesRefetches.Inc()
-			level.Warn(r.logger).Log("msg", "series size exceeded expected size; refetching", "id", id, "series length", n+int(l), "maxSeriesSize", maxSeriesSize)
+			level.Warn(r.block.logger).Log("msg", "series size exceeded expected size; refetching", "id", id, "series length", n+int(l), "maxSeriesSize", maxSeriesSize)
 
 			// Fetch plus to get the size of next one if exists.
 			return r.loadSeries(ctx, ids[i:], true, id, id+uint64(n+int(l)+1))
@@ -1686,7 +1682,7 @@ func (r *bucketIndexReader) loadSeries(ctx context.Context, ids []uint64, refetc
 		c = c[n : n+int(l)]
 		r.mtx.Lock()
 		r.loadedSeries[id] = c
-		r.cache.StoreSeries(r.ctx, r.block.meta.ULID, id, c)
+		r.block.indexCache.StoreSeries(r.ctx, r.block.meta.ULID, id, c)
 		r.mtx.Unlock()
 	}
 	return nil
